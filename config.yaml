@@ -1,0 +1,17 @@
+fabric_node:
+  catalog_url: "http://localhost:8781"
+  data_url: "http://localhost:8782"
+  identity_url: "http://localhost:8783"
+  notification_url: "http://localhost:8784"
+
+  auth_token: ""
+
+agent:
+  mode: "live" # Options: "mock", "openai", "ollama", "live"
+  api_key: ""
+  model: "gpt-4o"
+  temperature: 0.2
+
+storage:
+  download_dir: "./tmp/downloads"
+  output_dir: "./tmp/derived"
