@@ -3,14 +3,34 @@ fabric_node:
   data_url: "http://localhost:8782"
   identity_url: "http://localhost:8783"
   notification_url: "http://localhost:8784"
-
-  auth_token: ""
+  auth_token: ""            # or env FABRIC_AUTH_TOKEN; sent as "Authorization: Bearer ..."
+  timeout_seconds: 30
+  # SPARQL used when a graph is downloaded. {{graph}} and {{limit}} are filled in.
+  graph_dump_query: "SELECT ?s ?p ?o WHERE { GRAPH <{{graph}}> { ?s ?p ?o } } LIMIT {{limit}}"
+  graph_dump_limit: 50
 
 agent:
-  mode: "live" # Options: "mock", "openai", "ollama", "live"
-  api_key: ""
-  model: "gpt-4o"
-  temperature: 0.2
+  # How questions are understood:
+  #   openai     OpenAI or any OpenAI-compatible server (vLLM, LM Studio, ...; set base_url)
+  #   anthropic  Anthropic Messages API
+  #   ollama     local Ollama server (data never leaves the machine)
+  #   heuristic  no LLM, keyword search only ("mock" and "live" are aliases)
+  mode: "ollama"
+  api_key: ""               # or env OPENAI_API_KEY / ANTHROPIC_API_KEY
+  base_url: ""              # optional endpoint override
+  model: "mistral"           # e.g. claude-sonnet-5-5, llama3.1
+  temperature: 0.2          # negative = do not send (some reasoning models require this)
+  max_tokens: 2048
+  timeout_seconds: 120
+
+  max_retries: 2            # LLM may repair a rejected/failing query this many times (-1 = never)
+  max_rows: 100             # LIMIT cap for generated queries and rows printed
+  schema_max_chars: 6000    # per VoID / SHACL / example-queries document sent to the LLM
+  schema_ttl_seconds: 300
+  summarize: true           # also answer in prose from the results
+  # Free-text notes for the LLM about what the SPARQL endpoint supports, e.g.:
+  # dialect_hint: "The endpoint is a small in-memory store: avoid property paths and subqueries."
+  dialect_hint: ""
 
 storage:
   download_dir: "./tmp/downloads"

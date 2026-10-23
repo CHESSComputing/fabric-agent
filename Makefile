@@ -2,7 +2,7 @@ APP_NAME=fabric-agent
 BUILD_DIR=bin
 TAR_NAME=fabric-agent.tar.gz
 
-.PHONY: all build run test clean package
+.PHONY: all build run test vet fmt clean package
 
 all: build
 
@@ -19,6 +19,12 @@ run: build
 test:
 	@echo "Running unit tests..."
 	go test ./...
+
+vet:
+	go vet ./...
+
+fmt:
+	gofmt -l -w .
 
 clean:
 	@echo "Cleaning workspace..."

@@ -1,7 +1,10 @@
+// Package workflow runs the actions that follow a successful discovery query:
+// downloading the matching graphs and, optionally, deriving and registering a
+// new dataset.
 package workflow
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,97 +16,128 @@ import (
 	"github.com/CHESSComputing/fabric-agent/pkg/fabric"
 )
 
+// maxGraphsPerRun bounds how many graphs one request may download/process.
+const maxGraphsPerRun = 5
+
+// previewBytes is how much of a downloaded graph is echoed to the terminal.
+const previewBytes = 3000
+
+// Confirm asks the user a yes/no question; it must return false when it cannot ask.
+type Confirm func(prompt string) bool
+
 type Engine struct {
 	cfg          *config.Config
 	fabricClient *fabric.Client
-	aiAgent      *agent.Agent
 }
 
-func NewEngine(cfg *config.Config, client *fabric.Client, ag *agent.Agent) *Engine {
-	return &Engine{
-		cfg:          cfg,
-		fabricClient: client,
-		aiAgent:      ag,
-	}
+func NewEngine(cfg *config.Config, client *fabric.Client) *Engine {
+	return &Engine{cfg: cfg, fabricClient: client}
 }
 
-func (e *Engine) ExecuteDiscoveryAndProcessing(plan *agent.AgentPlan) error {
-	fmt.Println("\n[Step 1/4] Querying FabricNode Data Service for active graphs...")
-	datasets, err := e.fabricClient.SearchDatasets(plan.SearchQuery)
-	if err != nil {
-		return fmt.Errorf("discovery failed: %w", err)
+// Run performs the follow-up actions for ans according to its intent.
+func (e *Engine) Run(ctx context.Context, ans *agent.Answer, confirm Confirm) error {
+	if ans.Result == nil || ans.Plan.Intent == agent.IntentQuery {
+		return nil // clarification requested, or nothing further to do
 	}
-
-	if len(datasets) == 0 {
-		fmt.Println("No matching graphs found.")
+	if len(ans.Graphs) == 0 {
+		fmt.Println("\nThe query returned no named graphs to work with.")
 		return nil
 	}
 
-	fmt.Printf("Discovered %d registered dataset graph(s):\n", len(datasets))
-	for i, ds := range datasets {
-		fmt.Printf("   [%d] Sample: %-20s | Beamline: %-6s | Graph URI: %s\n",
-			i+1, ds.Name, ds.Beamline, ds.GraphURI)
+	graphs := ans.Graphs
+	if len(graphs) > maxGraphsPerRun {
+		fmt.Printf("\nQuery matched %d graphs; only the first %d will be used.\n", len(graphs), maxGraphsPerRun)
+		graphs = graphs[:maxGraphsPerRun]
 	}
 
-	target := datasets[0]
-	fmt.Printf("\n[Step 2/4] Fetching RDF triple contents for graph '%s'...\n", target.GraphURI)
-	localFile, err := e.fabricClient.DownloadDataset(target, e.cfg.Storage.DownloadDir)
-	if err != nil {
-		return fmt.Errorf("retrieval failed: %w", err)
-	}
-	fmt.Printf("   Graph content saved locally: %s\n", localFile)
-
-	fmt.Println("\n[Step 3/4] Inspecting Graph Structure & Observations...")
-	content, err := os.ReadFile(localFile)
-	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
+	fmt.Printf("\n[Step 1/3] Downloading %d graph(s) to %s ...\n", len(graphs), e.cfg.Storage.DownloadDir)
+	files := make(map[string]string, len(graphs))
+	for _, g := range graphs {
+		path, err := e.fabricClient.DownloadGraph(ctx, g, e.cfg.Storage.DownloadDir)
+		if err != nil {
+			return fmt.Errorf("retrieval failed: %w", err)
+		}
+		files[g] = path
+		fmt.Printf("   %s\n     -> %s\n", g, path)
 	}
 
-	fmt.Println("   --- Live Graph Content Payload ---")
-	var prettyJSON bytes.Buffer
-	if err := json.Indent(&prettyJSON, content, "   ", "  "); err == nil {
-		fmt.Println("   " + prettyJSON.String())
-	} else {
-		fmt.Println("   " + string(content))
+	fmt.Println("\n[Step 2/3] Inspecting downloaded content...")
+	for _, g := range graphs {
+		preview(files[g])
 	}
-	fmt.Println("   ----------------------------------")
 
-	fmt.Println("\nGenerating Derived Analytical Dataset...")
-	derivedGraphURI := fmt.Sprintf("%s/derived-%d", target.GraphURI, time.Now().Unix())
-	derivedFilepath := filepath.Join(e.cfg.Storage.OutputDir, "derived_dataset.json")
+	if ans.Plan.Intent != agent.IntentProcess {
+		return nil
+	}
 
-	if err := os.MkdirAll(e.cfg.Storage.OutputDir, 0755); err != nil {
+	fmt.Println("\n[Step 3/3] Deriving and registering new dataset(s)...")
+	if confirm == nil || !confirm(fmt.Sprintf("Register %d derived dataset(s) with the Notification Service at %s?",
+		len(graphs), e.cfg.FabricNode.NotificationURL)) {
+		fmt.Println("   Skipped registration (not confirmed; use --yes to confirm non-interactively).")
+		return nil
+	}
+	if err := os.MkdirAll(e.cfg.Storage.OutputDir, 0o755); err != nil {
 		return err
 	}
+	for _, g := range graphs {
+		if err := e.derive(ctx, g); err != nil {
+			return err
+		}
+	}
+	fmt.Println("\nWorkflow execution completed.")
+	return nil
+}
 
-	derivedPayload := map[string]interface{}{
+func (e *Engine) derive(ctx context.Context, graphURI string) error {
+	target := fabric.DatasetFromGraph(graphURI)
+	now := time.Now()
+	derivedGraphURI := fmt.Sprintf("%s/derived-%d", graphURI, now.Unix())
+
+	payload := map[string]interface{}{
 		"@context":      "https://chess.cornell.edu/ns#",
-		"parent_graph":  target.GraphURI,
+		"parent_graph":  graphURI,
 		"derived_graph": derivedGraphURI,
 		"sample_name":   target.Name,
 		"analysis":      "automated_sosa_observation_peak_fitting",
-		"processed_at":  time.Now().Format(time.RFC3339),
+		"processed_at":  now.Format(time.RFC3339),
 	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	file := filepath.Join(e.cfg.Storage.OutputDir, "derived_"+fabric.SafeName(graphURI)+".json")
+	if err := os.WriteFile(file, data, 0o644); err != nil {
+		return fmt.Errorf("writing derived dataset: %w", err)
+	}
+	fmt.Printf("   Derived dataset file: %s\n", file)
 
-	derivedJSON, _ := json.MarshalIndent(derivedPayload, "", "  ")
-	os.WriteFile(derivedFilepath, derivedJSON, 0644)
-	fmt.Printf("   Derived dataset file created: %s\n", derivedFilepath)
-
-	fmt.Println("\n[Step 4/4] Sending LDN Event to Notification Service Inbox ...")
-	derivedRecord := fabric.Dataset{
-		DID:        fmt.Sprintf("did:chess:%s:%s-derived", target.Beamline, target.Name),
-		Name:       fmt.Sprintf("Derived Peak Analysis - %s", target.Name),
+	record := fabric.Dataset{
+		DID:        target.DID + "-derived",
+		Name:       "Derived Peak Analysis - " + target.Name,
 		Beamline:   target.Beamline,
 		GraphURI:   derivedGraphURI,
 		DataFormat: "RDF/JSON-LD",
-		Metadata:   derivedPayload,
-		CreatedAt:  time.Now().Format(time.RFC3339),
+		Metadata:   payload,
+		CreatedAt:  now.Format(time.RFC3339),
 	}
-
-	if err := e.fabricClient.RegisterDataset(derivedRecord); err != nil {
+	if err := e.fabricClient.RegisterDataset(ctx, record); err != nil {
 		return fmt.Errorf("registration failed: %w", err)
 	}
-
-	fmt.Println("\nWorkflow execution completed against live FabricNode!")
+	fmt.Printf("   Registered %s via LDN\n", derivedGraphURI)
 	return nil
+}
+
+func preview(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Printf("   cannot read %s: %v\n", path, err)
+		return
+	}
+	text := string(data)
+	more := ""
+	if len(text) > previewBytes {
+		text = text[:previewBytes]
+		more = fmt.Sprintf("\n   ... (%d more bytes in file)", len(data)-previewBytes)
+	}
+	fmt.Printf("   --- %s ---\n%s%s\n", filepath.Base(path), text, more)
 }

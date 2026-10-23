@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/CHESSComputing/fabric-agent/pkg/agent"
 	"github.com/CHESSComputing/fabric-agent/pkg/config"
@@ -16,7 +17,8 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to YAML configuration file")
-	queryFlag := flag.String("query", "", "Single query string for non-interactive execution")
+	queryFlag := flag.String("query", "", "Single question for non-interactive execution")
+	yes := flag.Bool("yes", false, "Answer 'yes' to confirmation prompts (e.g. dataset registration)")
 	flag.Parse()
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -26,23 +28,45 @@ func main() {
 	}
 
 	fabricClient := fabric.NewClient(&cfg.FabricNode)
-	aiAgent := agent.NewAgent(&cfg.Agent, fabricClient)
-	engine := workflow.NewEngine(cfg, fabricClient, aiAgent)
+	aiAgent, err := agent.NewAgent(&cfg.Agent, fabricClient)
+	if err != nil {
+		fmt.Printf("Error creating agent: %v\n", err)
+		os.Exit(1)
+	}
+	engine := workflow.NewEngine(cfg, fabricClient)
 
-	printHeader()
+	printHeader(cfg, aiAgent)
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	confirm := func(prompt string) bool {
+		if *yes {
+			return true
+		}
+		if *queryFlag != "" { // non-interactive and no --yes
+			return false
+		}
+		fmt.Printf("%s [y/N] ", prompt)
+		if !scanner.Scan() {
+			return false
+		}
+		a := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		return a == "y" || a == "yes"
+	}
 
 	if *queryFlag != "" {
-		runQuery(engine, aiAgent, *queryFlag)
+		if !runQuery(cfg, engine, aiAgent, *queryFlag, confirm) {
+			os.Exit(1)
+		}
 		return
 	}
 
-	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("\nfabric-agent> ")
 		if !scanner.Scan() {
 			break
 		}
-
 		input := strings.TrimSpace(scanner.Text())
 		if input == "" {
 			continue
@@ -51,29 +75,61 @@ func main() {
 			fmt.Println("Exiting CLI. Goodbye!")
 			break
 		}
-
-		runQuery(engine, aiAgent, input)
+		runQuery(cfg, engine, aiAgent, input, confirm)
 	}
 }
 
-func runQuery(engine *workflow.Engine, aiAgent *agent.Agent, question string) {
-	ctx := context.Background()
-	plan, err := aiAgent.ProcessQuestion(ctx, question)
+// runQuery handles one question and reports whether it succeeded.
+func runQuery(cfg *config.Config, engine *workflow.Engine, aiAgent *agent.Agent, question string, confirm workflow.Confirm) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	ans, err := aiAgent.Ask(ctx, question)
 	if err != nil {
 		fmt.Printf("Agent error: %v\n", err)
+		return false
+	}
+	printAnswer(cfg, ans)
+
+	if err := engine.Run(ctx, ans, confirm); err != nil {
+		fmt.Printf("Workflow execution error: %v\n", err)
+		return false
+	}
+	return true
+}
+
+func printAnswer(cfg *config.Config, ans *agent.Answer) {
+	p := ans.Plan
+	if p.Clarification != "" && ans.Result == nil {
+		fmt.Printf("\n[AI Agent] I need a bit more information: %s\n", p.Clarification)
 		return
 	}
-
-	if err := engine.ExecuteDiscoveryAndProcessing(plan); err != nil {
-		fmt.Printf("Workflow execution error: %v\n", err)
+	if p.Explanation != "" {
+		fmt.Printf("\n[AI Agent] %s\n", p.Explanation)
+	}
+	fmt.Printf("[AI Agent] intent=%s, attempts=%d\n", p.Intent, ans.Attempts)
+	fmt.Println("\n--- SPARQL ---")
+	fmt.Println(p.SPARQL)
+	fmt.Println("--------------")
+	if ans.Result != nil {
+		ans.Result.WriteTable(os.Stdout, cfg.Agent.MaxRows)
+	}
+	if ans.Summary != "" {
+		fmt.Printf("\n[AI Agent] %s\n", ans.Summary)
 	}
 }
 
-func printHeader() {
+func printHeader(cfg *config.Config, a *agent.Agent) {
 	fmt.Println("==================================================================")
 	fmt.Println("       FOXDEN FabricNode AI Data Discovery & Processing Agent     ")
 	fmt.Println("==================================================================")
-	fmt.Println("Type your dataset prompt or 'exit' to quit.")
-	fmt.Println("Example: 'Find all ID3A x-ray diffraction datasets above 300K'")
+	if a.UsesLLM() {
+		fmt.Printf("Language model: %s (%s)\n", cfg.Agent.Model, cfg.Agent.Mode)
+	} else {
+		fmt.Println("No LLM configured: using the keyword-based fallback planner.")
+		fmt.Println("Set agent.mode to openai, anthropic or ollama for real questions.")
+	}
+	fmt.Println("Ask in plain English, or type 'exit' to quit.")
+	fmt.Println("Example: 'Which datasets on beamline ID3A contain thaumatin?'")
 	fmt.Println("------------------------------------------------------------------")
 }
