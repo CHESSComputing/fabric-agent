@@ -14,6 +14,7 @@ import (
 
 	"github.com/CHESSComputing/fabric-agent/pkg/config"
 	"github.com/CHESSComputing/fabric-agent/pkg/logx"
+	"github.com/CHESSComputing/fabric-agent/pkg/trace"
 )
 
 // Message is one chat turn. Role is "system", "user" or "assistant".
@@ -80,10 +81,18 @@ func logRequest(provider, model, url string, msgs []Message) time.Time {
 	}
 	logx.Infof("LLM request: provider=%s model=%s url=%s messages=%d prompt_chars=%d (~%d tokens)",
 		provider, model, url, len(msgs), chars, chars/4)
+	if trace.Enabled() {
+		tm := make([]trace.Message, len(msgs))
+		for i, m := range msgs {
+			tm[i] = trace.Message{Role: m.Role, Content: m.Content}
+		}
+		trace.BeginLLM(provider, model, url, tm)
+	}
 	return time.Now()
 }
 
 func logResponse(start time.Time, reply string, err error) {
+	trace.EndLLM(reply, err)
 	took := time.Since(start).Round(time.Millisecond)
 	if err != nil {
 		logx.Infof("LLM request failed after %s: %v", took, err)

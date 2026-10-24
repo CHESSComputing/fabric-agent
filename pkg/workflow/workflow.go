@@ -15,6 +15,7 @@ import (
 	"github.com/CHESSComputing/fabric-agent/pkg/config"
 	"github.com/CHESSComputing/fabric-agent/pkg/fabric"
 	"github.com/CHESSComputing/fabric-agent/pkg/logx"
+	"github.com/CHESSComputing/fabric-agent/pkg/trace"
 )
 
 // maxGraphsPerRun bounds how many graphs one request may download/process.
@@ -76,6 +77,7 @@ func (e *Engine) Run(ctx context.Context, ans *agent.Answer, confirm Confirm) er
 	if confirm == nil || !confirm(fmt.Sprintf("Register %d derived dataset(s) with the Notification Service at %s?",
 		len(graphs), e.cfg.FabricNode.NotificationURL)) {
 		fmt.Println("   Skipped registration (not confirmed; use --yes to confirm non-interactively).")
+		trace.RecordAction("registration_skipped", map[string]string{"reason": "not confirmed"})
 		return nil
 	}
 	if err := os.MkdirAll(e.cfg.Storage.OutputDir, 0o755); err != nil {
@@ -112,6 +114,7 @@ func (e *Engine) derive(ctx context.Context, graphURI string) error {
 		return fmt.Errorf("writing derived dataset: %w", err)
 	}
 	fmt.Printf("   Derived dataset file: %s\n", file)
+	trace.RecordAction("derive", map[string]string{"parent_graph": graphURI, "derived_graph": derivedGraphURI, "file": file})
 
 	record := fabric.Dataset{
 		DID:        target.DID + "-derived",
@@ -126,6 +129,7 @@ func (e *Engine) derive(ctx context.Context, graphURI string) error {
 		return fmt.Errorf("registration failed: %w", err)
 	}
 	fmt.Printf("   Registered %s via LDN\n", derivedGraphURI)
+	trace.RecordAction("register", map[string]string{"derived_graph": derivedGraphURI, "notification_url": e.cfg.FabricNode.NotificationURL})
 	return nil
 }
 

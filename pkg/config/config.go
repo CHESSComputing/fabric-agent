@@ -14,9 +14,38 @@ type Config struct {
 	// LogLevel controls diagnostic output on stderr: off, info, debug, trace.
 	// Overridden by env FABRIC_AGENT_LOG_LEVEL and the --log-level flag.
 	LogLevel   string           `yaml:"log_level"`
+	Output     OutputConfig     `yaml:"output"`
 	FabricNode FabricNodeConfig `yaml:"fabric_node"`
 	Agent      AgentConfig      `yaml:"agent"`
 	Storage    StorageConfig    `yaml:"storage"`
+}
+
+// OutputConfig controls how answers are printed on stdout. Overridden by the
+// --output-format flag.
+//
+// Format:
+//
+//	stdout  one "key : value" line per field, rows separated by "---" (default)
+//	table   aligned columns; long values are shortened
+//	json    one complete JSON record per question, with the plan, the node
+//	        URLs called and the LLM conversation; progress text goes to stderr
+type OutputConfig struct {
+	Format string `yaml:"format"`
+	// OmitBodies leaves the node response bodies out of the JSON record.
+	OmitBodies bool `yaml:"omit_bodies"`
+}
+
+// NormalizeFormat validates an output format name and returns its canonical form.
+func NormalizeFormat(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "stdout", "text", "kv", "key-value", "keyvalue":
+		return "stdout", nil
+	case "table":
+		return "table", nil
+	case "json":
+		return "json", nil
+	}
+	return "", fmt.Errorf("unknown output format %q (use stdout, table or json)", s)
 }
 
 type FabricNodeConfig struct {
@@ -165,6 +194,11 @@ func (c *Config) validate() error {
 	if _, err := logx.Parse(c.LogLevel); err != nil {
 		return fmt.Errorf("log_level: %w", err)
 	}
+	format, err := NormalizeFormat(c.Output.Format)
+	if err != nil {
+		return fmt.Errorf("output.format: %w", err)
+	}
+	c.Output.Format = format
 	a := &c.Agent
 	switch a.Mode {
 	case "heuristic", "ollama":

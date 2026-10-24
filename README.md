@@ -66,6 +66,42 @@ written to stderr:
 ./bin/fabric-agent --log-level debug --query "Which datasets mention thaumatin?"
 ```
 
+## Output formats
+
+Choose with `output.format` in `config.yaml` or `--output-format` on the command line.
+
+`--output-format stdout` (default): every field on its own aligned line, never
+truncated, rows separated by `---`:
+
+```
+graph     : https://chess.cornell.edu/graph/id3a/btr=btr101/cycle=2024-3/sample_name=thaumatin-a
+beamline  : id3a
+sample    : thaumatin-a
+matched_by: thaumatin: graph name
+---
+Total     : 1 row(s)
+```
+
+`--output-format table`: aligned columns (long values are shortened).
+
+`--output-format json`: one JSON record per question on stdout (progress text
+and logs go to stderr, so `... --output-format json > result.json` is clean). A
+record contains:
+
+| key              | content                                                                 |
+|------------------|-------------------------------------------------------------------------|
+| `input`, `status`, `error`, `timestamp`, `duration_ms`, `environment` | the question, outcome (`ok`, `clarification`, `error`) and setup |
+| `query`, `plan`  | the calls chosen for the question, the intent and the model's explanation |
+| `calls[].rows`   | the answer: a list of records that all have the same keys               |
+| `graphs`         | dataset graphs found                                                     |
+| `node_api_calls` | every HTTP request to the node: method, URL, status, size, time, response body |
+| `llm_calls`      | every request to the language model (all messages) and its raw response |
+| `actions`        | downloads, derived datasets and registrations that were performed       |
+
+`output.omit_bodies: true` drops the node response bodies from the record.
+(The node has no SPARQL engine, so `query`/`plan` are node API calls, and the
+URLs actually requested are in `node_api_calls`.)
+
 ## Troubleshooting Ollama
 
 The agent checks Ollama before its first request and logs (level `info`) whether

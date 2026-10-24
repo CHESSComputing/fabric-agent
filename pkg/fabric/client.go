@@ -16,6 +16,7 @@ import (
 
 	"github.com/CHESSComputing/fabric-agent/pkg/config"
 	"github.com/CHESSComputing/fabric-agent/pkg/logx"
+	"github.com/CHESSComputing/fabric-agent/pkg/trace"
 )
 
 type Dataset struct {
@@ -61,8 +62,11 @@ func (c *Client) newRequest(ctx context.Context, method, u string, body io.Reade
 // do executes req and returns the body of a 2xx response. Any other status is
 // an error that includes the start of the body, so callers (and the LLM repair
 // loop) can see what the server complained about. Every call is logged.
-func (c *Client) do(req *http.Request) ([]byte, error) {
+func (c *Client) do(req *http.Request) (out []byte, err error) {
 	start := time.Now()
+	status := 0
+	var recorded []byte
+	defer func() { recordAPI(req, start, status, recorded, err) }()
 	logx.Infof("node API  %s %s", req.Method, req.URL.String())
 
 	resp, err := c.httpClient.Do(req)
@@ -71,7 +75,9 @@ func (c *Client) do(req *http.Request) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	status = resp.StatusCode
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	recorded = data
 	if err != nil {
 		logx.Infof("node API  reading body failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
 		return nil, err
@@ -87,6 +93,26 @@ func (c *Client) do(req *http.Request) ([]byte, error) {
 		return nil, &StatusError{Code: resp.StatusCode, Path: req.URL.Path, Body: msg}
 	}
 	return data, nil
+}
+
+// recordAPI hands one finished HTTP exchange to the (usually disabled) tracer.
+func recordAPI(req *http.Request, start time.Time, status int, body []byte, err error) {
+	if !trace.Enabled() {
+		return
+	}
+	rec := trace.APICall{
+		Method:       req.Method,
+		URL:          req.URL.String(),
+		Started:      start.Format(time.RFC3339Nano),
+		DurationMS:   time.Since(start).Milliseconds(),
+		Status:       status,
+		Bytes:        len(body),
+		ResponseBody: string(body),
+	}
+	if err != nil {
+		rec.Error = err.Error()
+	}
+	trace.RecordAPI(rec)
 }
 
 // StatusError is returned when the node answers with a non-2xx status.
@@ -144,6 +170,9 @@ func (c *Client) DownloadGraph(ctx context.Context, graphURI, destDir string) (s
 		return "", err
 	}
 	logx.Infof("saved %d triple(s) of %s to %s", len(res.Rows), graphURI, filePath)
+	trace.RecordAction("download", map[string]string{
+		"graph": graphURI, "file": filePath, "triples": fmt.Sprint(len(res.Rows)),
+	})
 	return filePath, nil
 }
 

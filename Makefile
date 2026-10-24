@@ -11,7 +11,7 @@ build:
 	go mod tidy
 	@echo "Building $(APP_NAME)..."
 	@mkdir -p $(BUILD_DIR)
-	go build -o $(BUILD_DIR)/$(APP_NAME) main.go
+	go build -o $(BUILD_DIR)/$(APP_NAME) main.go output.go
 
 run: build
 	@./$(BUILD_DIR)/$(APP_NAME) --config config.yaml

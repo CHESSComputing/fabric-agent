@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/CHESSComputing/fabric-agent/pkg/config"
 	"github.com/CHESSComputing/fabric-agent/pkg/fabric"
 	"github.com/CHESSComputing/fabric-agent/pkg/logx"
+	"github.com/CHESSComputing/fabric-agent/pkg/trace"
 	"github.com/CHESSComputing/fabric-agent/pkg/workflow"
 )
 
@@ -21,6 +23,7 @@ func main() {
 	queryFlag := flag.String("query", "", "Single question for non-interactive execution")
 	yes := flag.Bool("yes", false, "Answer 'yes' to confirmation prompts (e.g. dataset registration)")
 	logLevel := flag.String("log-level", "", "Diagnostic output on stderr: off, info, debug or trace (overrides log_level in the config file)")
+	outputFormat := flag.String("output-format", "", "How answers are printed: stdout (key : value), table or json (overrides output.format in the config file)")
 	flag.Parse()
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -40,6 +43,21 @@ func main() {
 		os.Exit(1)
 	}
 	logx.SetLevel(level)
+
+	// precedence: --output-format flag > config file
+	format := cfg.Output.Format
+	if *outputFormat != "" {
+		if format, err = config.NormalizeFormat(*outputFormat); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	// In JSON mode stdout must carry nothing but JSON: the original stdout is
+	// kept for the records and all progress text goes to stderr.
+	jsonOut := io.Writer(os.Stdout)
+	if format == "json" {
+		os.Stdout = os.Stderr
+	}
 	logx.Infof("configuration loaded from %s: node data=%s catalog=%s, agent mode=%s model=%s",
 		*configPath, cfg.FabricNode.DataURL, cfg.FabricNode.CatalogURL, cfg.Agent.Mode, cfg.Agent.Model)
 
@@ -72,7 +90,7 @@ func main() {
 	}
 
 	if *queryFlag != "" {
-		if !runQuery(cfg, engine, aiAgent, *queryFlag, confirm) {
+		if !runQuery(cfg, engine, aiAgent, *queryFlag, confirm, format, jsonOut) {
 			os.Exit(1)
 		}
 		return
@@ -91,48 +109,42 @@ func main() {
 			fmt.Println("Exiting CLI. Goodbye!")
 			break
 		}
-		runQuery(cfg, engine, aiAgent, input, confirm)
+		runQuery(cfg, engine, aiAgent, input, confirm, format, jsonOut)
 	}
 }
 
 // runQuery handles one question and reports whether it succeeded.
-func runQuery(cfg *config.Config, engine *workflow.Engine, aiAgent *agent.Agent, question string, confirm workflow.Confirm) bool {
+func runQuery(cfg *config.Config, engine *workflow.Engine, aiAgent *agent.Agent, question string, confirm workflow.Confirm, format string, jsonOut io.Writer) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	asJSON := format == "json"
+	started := time.Now()
+	if asJSON {
+		trace.Start(cfg.Output.OmitBodies)
+		defer trace.Stop()
+	}
 
 	ans, err := aiAgent.Ask(ctx, question)
 	if err != nil {
 		fmt.Printf("Agent error: %v\n", err)
-		return false
-	}
-	printAnswer(cfg, ans)
-
-	if err := engine.Run(ctx, ans, confirm); err != nil {
-		fmt.Printf("Workflow execution error: %v\n", err)
-		return false
-	}
-	return true
-}
-
-func printAnswer(cfg *config.Config, ans *agent.Answer) {
-	p := ans.Plan
-	if len(ans.Steps) == 0 {
-		if p.Clarification != "" {
-			fmt.Printf("\n[AI Agent] I need a bit more information: %s\n", p.Clarification)
+		if asJSON {
+			writeJSON(jsonOut, buildRecord(cfg, question, started, nil, err, nil))
 		}
-		return
+		return false
 	}
-	if p.Explanation != "" {
-		fmt.Printf("\n[AI Agent] %s\n", p.Explanation)
+	if !asJSON {
+		printAnswer(cfg, ans, format)
 	}
-	fmt.Printf("[AI Agent] intent=%s, attempts=%d\n", p.Intent, ans.Attempts)
-	for i, st := range ans.Steps {
-		fmt.Printf("\n--- Call %d/%d: %s ---\n", i+1, len(ans.Steps), st.Call)
-		st.Result.WriteTable(os.Stdout, cfg.Agent.MaxRows)
+
+	werr := engine.Run(ctx, ans, confirm)
+	if werr != nil {
+		fmt.Printf("Workflow execution error: %v\n", werr)
 	}
-	if ans.Summary != "" {
-		fmt.Printf("\n[AI Agent] %s\n", ans.Summary)
+	if asJSON {
+		writeJSON(jsonOut, buildRecord(cfg, question, started, ans, nil, werr))
 	}
+	return werr == nil
 }
 
 func printHeader(cfg *config.Config, a *agent.Agent) {

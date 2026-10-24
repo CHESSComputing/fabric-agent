@@ -167,6 +167,46 @@ func (r *Result) WriteTable(w io.Writer, maxRows int) {
 	fmt.Fprintln(w, ")")
 }
 
+// WriteKeyValue prints every row as aligned "key : value" lines, rows separated
+// by "---", followed by a total. Values are never shortened, so long IRIs stay
+// intact and can be copied from the terminal. At most maxRows rows are shown.
+func (r *Result) WriteKeyValue(w io.Writer, maxRows int) {
+	if !r.Structured || r.Boolean != nil {
+		r.WriteTable(w, maxRows) // raw answers and ASK results have no rows to list
+		return
+	}
+
+	width := utf8.RuneCountInString("Total")
+	for _, v := range r.Vars {
+		if n := utf8.RuneCountInString(v); n > width {
+			width = n
+		}
+	}
+	pad := func(k string) string { return k + strings.Repeat(" ", width-utf8.RuneCountInString(k)) }
+	cont := "\n" + strings.Repeat(" ", width+2) // continuation lines of multi-line values
+
+	rows := r.Rows
+	if maxRows > 0 && len(rows) > maxRows {
+		rows = rows[:maxRows]
+	}
+	for _, row := range rows {
+		for _, v := range r.Vars {
+			val := strings.ReplaceAll(row[v], "\n", cont)
+			fmt.Fprintln(w, strings.TrimRight(pad(v)+": "+val, " "))
+		}
+		fmt.Fprintln(w, "---")
+	}
+
+	total := fmt.Sprintf("%d row(s)", len(r.Rows))
+	if len(rows) < len(r.Rows) {
+		total += fmt.Sprintf(" (%d shown; raise agent.max_rows to see more)", len(rows))
+	}
+	fmt.Fprintf(w, "%s: %s\n", pad("Total"), total)
+	for _, n := range r.Notes {
+		fmt.Fprintf(w, "%s: %s\n", pad("Note"), n)
+	}
+}
+
 func (r *Result) writeNotes(w io.Writer) {
 	for _, n := range r.Notes {
 		fmt.Fprintf(w, "note: %s\n", n)

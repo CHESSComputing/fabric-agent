@@ -6,6 +6,17 @@
 # Overridden by env FABRIC_AGENT_LOG_LEVEL and by the --log-level flag.
 log_level: "info"
 
+# How answers are printed on stdout. Overridden by the --output-format flag.
+#   stdout  one "key : value" line per field, rows separated by "---" (default);
+#           values are never shortened, so long graph IRIs stay intact
+#   table   aligned columns; long values are shortened with "…"
+#   json    one complete JSON record per question: the answer plus the plan, the node
+#           URLs called (with responses) and the full LLM conversation. Stdout then holds
+#           only JSON; progress text and logs go to stderr.
+output:
+  format: "stdout"
+  omit_bodies: true        # json only: leave node response bodies out to keep records small
+
 fabric_node:
   catalog_url: "http://localhost:8781"
   data_url: "http://localhost:8782"
