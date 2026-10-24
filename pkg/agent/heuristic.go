@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"fmt"
 	"regexp"
 	"strings"
 )
@@ -13,15 +12,18 @@ var stopwords = map[string]bool{}
 func init() {
 	for _, w := range strings.Fields(`a an and all any are as at be by can data dataset datasets find for from get give
 		has have how i in is it list me my of on or show that the their them there these this those to was were what
-		when where which with without please about into over under above below`) {
+		when where which with without please about into over under above below mention mentions mentioning contain
+		contains containing measured using related download fetch save process analyse analyze derive register
+		beamline beamlines available exist exists`) {
 		stopwords[w] = true
 	}
 }
 
 // heuristicPlan is the no-LLM fallback: it keeps the informative words of the
-// question and returns graphs whose IRI or any literal/IRI object mentions any
-// of them. It is deliberately simple; use an LLM mode for real questions.
-func heuristicPlan(question string, maxRows int) *Plan {
+// question as keywords for a "find" call, recognizes a beamline id if one of
+// the node's beamlines is named, and detects download/process verbs. It is
+// deliberately simple; use an LLM mode for real questions.
+func heuristicPlan(question string, sch *Schema) *Plan {
 	lower := strings.ToLower(question)
 
 	intent := IntentQuery
@@ -32,28 +34,35 @@ func heuristicPlan(question string, maxRows int) *Plan {
 		intent = IntentDownload
 	}
 
-	var conds []string
+	beamline := ""
+	var kws []string
 	seen := map[string]bool{}
 	for _, w := range wordRe.FindAllString(lower, -1) {
-		if stopwords[w] || len(w) < 2 || seen[w] {
+		if seen[w] {
 			continue
 		}
 		seen[w] = true
-		conds = append(conds, fmt.Sprintf(`CONTAINS(LCASE(STR(?graph)), "%s") || CONTAINS(LCASE(STR(?o)), "%s")`, w, w))
+		if sch != nil && sch.hasBeamline(w) {
+			beamline = w
+			continue
+		}
+		if stopwords[w] || len(w) < 2 {
+			continue
+		}
+		kws = append(kws, w)
 	}
 
-	filter := ""
-	if len(conds) > 0 {
-		filter = " FILTER(" + strings.Join(conds, " || ") + ")"
+	call := Call{Op: OpFind, Keywords: kws, Beamline: beamline}
+	explanation := "Keyword search (no LLM configured): datasets whose name or text values contain all the key words of your question."
+	switch {
+	case len(kws) == 0 && beamline == "" && strings.Contains(lower, "beamline"):
+		call = Call{Op: OpBeamlines}
+		explanation = "Lists the beamlines of the node."
+	case len(kws) == 0:
+		call = Call{Op: OpListGraphs, Beamline: beamline}
+		explanation = "Lists the datasets of the node."
 	}
-	q := fmt.Sprintf("SELECT DISTINCT ?graph WHERE { GRAPH ?graph { ?s ?p ?o }%s } LIMIT %d", filter, maxRows)
-
-	return &Plan{
-		Question:    question,
-		Intent:      intent,
-		SPARQL:      q,
-		Explanation: "Keyword search (no LLM configured): graphs mentioning any of the words in your question.",
-	}
+	return &Plan{Question: question, Intent: intent, Calls: []Call{call}, Explanation: explanation}
 }
 
 func containsAny(s string, subs ...string) bool {

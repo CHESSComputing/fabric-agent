@@ -12,6 +12,7 @@ import (
 	"github.com/CHESSComputing/fabric-agent/pkg/agent"
 	"github.com/CHESSComputing/fabric-agent/pkg/config"
 	"github.com/CHESSComputing/fabric-agent/pkg/fabric"
+	"github.com/CHESSComputing/fabric-agent/pkg/logx"
 	"github.com/CHESSComputing/fabric-agent/pkg/workflow"
 )
 
@@ -19,6 +20,7 @@ func main() {
 	configPath := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	queryFlag := flag.String("query", "", "Single question for non-interactive execution")
 	yes := flag.Bool("yes", false, "Answer 'yes' to confirmation prompts (e.g. dataset registration)")
+	logLevel := flag.String("log-level", "", "Diagnostic output on stderr: off, info, debug or trace (overrides log_level in the config file)")
 	flag.Parse()
 
 	cfg, err := config.LoadConfig(*configPath)
@@ -26,6 +28,20 @@ func main() {
 		fmt.Printf("Error loading configuration '%s': %v\n", *configPath, err)
 		os.Exit(1)
 	}
+
+	// precedence: --log-level flag > FABRIC_AGENT_LOG_LEVEL > config file
+	levelName := cfg.LogLevel
+	if *logLevel != "" {
+		levelName = *logLevel
+	}
+	level, err := logx.Parse(levelName)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+	logx.SetLevel(level)
+	logx.Infof("configuration loaded from %s: node data=%s catalog=%s, agent mode=%s model=%s",
+		*configPath, cfg.FabricNode.DataURL, cfg.FabricNode.CatalogURL, cfg.Agent.Mode, cfg.Agent.Model)
 
 	fabricClient := fabric.NewClient(&cfg.FabricNode)
 	aiAgent, err := agent.NewAgent(&cfg.Agent, fabricClient)
@@ -100,19 +116,19 @@ func runQuery(cfg *config.Config, engine *workflow.Engine, aiAgent *agent.Agent,
 
 func printAnswer(cfg *config.Config, ans *agent.Answer) {
 	p := ans.Plan
-	if p.Clarification != "" && ans.Result == nil {
-		fmt.Printf("\n[AI Agent] I need a bit more information: %s\n", p.Clarification)
+	if len(ans.Steps) == 0 {
+		if p.Clarification != "" {
+			fmt.Printf("\n[AI Agent] I need a bit more information: %s\n", p.Clarification)
+		}
 		return
 	}
 	if p.Explanation != "" {
 		fmt.Printf("\n[AI Agent] %s\n", p.Explanation)
 	}
 	fmt.Printf("[AI Agent] intent=%s, attempts=%d\n", p.Intent, ans.Attempts)
-	fmt.Println("\n--- SPARQL ---")
-	fmt.Println(p.SPARQL)
-	fmt.Println("--------------")
-	if ans.Result != nil {
-		ans.Result.WriteTable(os.Stdout, cfg.Agent.MaxRows)
+	for i, st := range ans.Steps {
+		fmt.Printf("\n--- Call %d/%d: %s ---\n", i+1, len(ans.Steps), st.Call)
+		st.Result.WriteTable(os.Stdout, cfg.Agent.MaxRows)
 	}
 	if ans.Summary != "" {
 		fmt.Printf("\n[AI Agent] %s\n", ans.Summary)
@@ -129,6 +145,7 @@ func printHeader(cfg *config.Config, a *agent.Agent) {
 		fmt.Println("No LLM configured: using the keyword-based fallback planner.")
 		fmt.Println("Set agent.mode to openai, anthropic or ollama for real questions.")
 	}
+	fmt.Printf("Diagnostics: log level %q on stderr (change with --log-level or log_level in the config)\n", logx.GetLevel())
 	fmt.Println("Ask in plain English, or type 'exit' to quit.")
 	fmt.Println("Example: 'Which datasets on beamline ID3A contain thaumatin?'")
 	fmt.Println("------------------------------------------------------------------")

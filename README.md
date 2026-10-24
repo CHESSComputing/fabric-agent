@@ -2,60 +2,94 @@
 
 An interactive agent written in Go that lets users talk to a CHESS
 [FabricNode](https://github.com/CHESSComputing/FabricNode) in plain English.
-A question is translated into a SPARQL query, executed against the node,
-repaired if the endpoint rejects it, and the answer is shown as a table (and
-optionally as a short prose summary). Matching datasets can then be downloaded
-and processed.
+A question is turned into calls against the node's REST API, the answer is shown
+as a table (and optionally as a short prose summary), and the matching datasets
+can then be downloaded and processed.
+
+## What the node can and cannot do
+
+The data-service endpoint named `/sparql` is **not a SPARQL engine**. It is a
+triple-pattern API, and the agent plans against what it really offers:
+
+| node API                                        | meaning                                              |
+|-------------------------------------------------|------------------------------------------------------|
+| `GET /graphs`, `/beamlines/{bl}/graphs`         | dataset graphs (one per dataset)                     |
+| `GET /sparql?s=&p=&o=&g=`                       | exact-match triple filter, at most 100 triples       |
+| `GET /sparql?search=<kw>`                       | substring search in **literal values only**          |
+| `GET /sparql?describe=<iri>`                    | triples where the IRI is subject or object           |
+| `GET /beamlines/{bl}/datasets/{did}/sparql`     | all triples of one dataset (used for downloads)      |
+| `GET /catalog/beamlines` (catalog service)      | beamline catalog                                     |
+
+Sample names (e.g. `thaumatin-a`) live in the graph IRI
+`<base>/graph/<beamline>/btr=…/cycle=…/sample_name=…`, which `search` cannot
+see. The agent's `find` operation therefore combines graph-name matching with
+the node's literal search.
 
 ## How it works
 
 ```
- question ─► schema discovery ─► LLM planner ─► validator ─► SPARQL endpoint ─► table / summary
- (English)   catalog /.well-known   JSON plan     read-only     data-service        │
-             VoID, SHACL, examples  intent+SPARQL LIMIT cap     /sparql             ▼
-             /graphs, live classes       ▲                          │        download / process
-             and properties              └── error or empty result ◄┘        (asks before writing)
-                                             fed back (max_retries)
+question ─► schema ─► LLM planner ─► validate ─► execute calls ─► tables / summary
+(English)   beamlines  JSON plan:     op, args    node REST API         │
+            graphs     intent + 1-3   checked     (see table above)     ▼
+            predicates calls                          ▲          download / process
+                          ▲                           │          (asks before writing)
+                          └── node error / nothing found fed back (max_retries)
 ```
 
-1. **Schema discovery** (`pkg/agent/schema.go`). Nothing about beamlines,
-   samples or vocabularies is hardcoded. On first use the agent reads the
-   node's self-description (`/.well-known/void`, `/shacl`, `/sparql-examples`
-   from the Catalog Service), the list of named graphs (`/graphs`) and the
-   classes and properties actually in use, and caches them
-   (`schema_ttl_seconds`). This follows the node's "progressive disclosure"
-   design.
-2. **Planning** (`pkg/agent`). The LLM returns JSON with an `intent`
-   (`query`, `download`, `process`), the `sparql`, and a one-line explanation,
-   or a `clarification` question if the request is ambiguous.
-3. **Validation** (`pkg/sparql`). LLM output is untrusted. Only
-   SELECT/ASK/CONSTRUCT/DESCRIBE pass; updates and `SERVICE` are rejected; a
-   top-level `LIMIT` (at most `max_rows`) is enforced.
-4. **Execution and repair.** If the endpoint returns an error, or the query
-   returns nothing, the message is sent back to the LLM for another attempt.
-5. **Follow-up actions** (`pkg/workflow`). `download` saves the matching graphs;
-   `process` also derives a new dataset and registers it through the
-   Notification Service, but only after you confirm (or pass `--yes`).
+Operations the planner can choose (`pkg/agent/calls.go`):
+`find` (keywords in graph name or text values, ANDed), `list_graphs`
+(optionally by beamline and name keywords), `triples` (exact pattern),
+`describe`, `beamlines`.
 
-The last three questions are remembered, so follow-ups such as
-"now only the ones measured on ID1" work in the interactive prompt.
+Intent `download` saves the matching datasets; `process` also derives a new
+dataset and registers it with the Notification Service, but only after you
+confirm (or pass `--yes`). The last three questions are remembered for
+follow-ups.
 
-## Configuration
+## Configuration and debugging
 
-See `config.yaml`. The important part is `agent.mode`:
+See `config.yaml`. Key settings: `agent.mode` (`ollama`, `openai`, `anthropic`,
+`heuristic`), `agent.model`, `agent.num_ctx` (Ollama context window) and
+`log_level`.
 
-| mode        | what it uses                                           |
-|-------------|--------------------------------------------------------|
-| `openai`    | OpenAI, or any OpenAI-compatible server via `base_url` |
-| `anthropic` | Anthropic Messages API                                 |
-| `ollama`    | a local Ollama server; data never leaves your machine  |
-| `heuristic` | no LLM; keyword search only (`mock`/`live` are aliases)|
+`log_level` (also `--log-level` or `FABRIC_AGENT_LOG_LEVEL`) controls what is
+written to stderr:
 
-API keys can be given in the file or via `OPENAI_API_KEY` /
-`ANTHROPIC_API_KEY`; the FabricNode token via `FABRIC_AUTH_TOKEN`.
+| level   | shows                                                                           |
+|---------|---------------------------------------------------------------------------------|
+| `off`   | nothing                                                                         |
+| `info`  | every node API call (URL, status, size, time), every LLM call, the plan, retries, "still waiting" heartbeats |
+| `debug` | + node response bodies, the system/user prompts, the raw LLM reply, schema contents (truncated) |
+| `trace` | + everything untruncated, including the HTTP bodies sent to the LLM             |
 
-If your SPARQL endpoint supports only a subset of SPARQL, tell the model with
-`agent.dialect_hint`. Errors are also fed back automatically.
+```bash
+./bin/fabric-agent --log-level debug --query "Which datasets mention thaumatin?"
+```
+
+## Troubleshooting Ollama
+
+The agent checks Ollama before its first request and logs (level `info`) whether
+it is reachable, which models are installed and loaded, and whether the model
+runs on CPU or GPU. To check by hand:
+
+```bash
+curl http://localhost:11434/                  # -> "Ollama is running"
+curl http://localhost:11434/api/tags          # installed models (is "mistral" listed?)
+ollama ps                                     # loaded models; PROCESSOR column shows CPU vs GPU
+time curl http://localhost:11434/api/chat -d \
+  '{"model":"mistral","messages":[{"role":"user","content":"Say hi"}],"stream":false}'
+```
+
+A browser visiting `/api/chat` shows `405 Method Not Allowed`: that is normal,
+the endpoint only accepts POST, and it proves the server is up.
+
+If the last command is slow, the model is simply slow on your hardware: the
+first request loads the model into memory, then the prompt (~1,200 tokens) is
+processed, then the reply is generated. Remedies: warm the model once with
+`ollama run mistral "hi"`, use a smaller model (e.g. `llama3.2:3b` or
+`qwen2.5:3b`), lower `agent.num_ctx` to 4096, use a GPU, and raise
+`agent.timeout_seconds` if needed. The `info` log prints a "still waiting"
+line every 10 seconds, and Ollama's token counts when it answers.
 
 ## Usage
 
@@ -63,11 +97,9 @@ If your SPARQL endpoint supports only a subset of SPARQL, tell the model with
 make build
 make run                                   # interactive
 ./bin/fabric-agent --query "Which datasets mention thaumatin?"
-./bin/fabric-agent --query "Download the silicon standard on ID1" 
-./bin/fabric-agent --query "Process all FAST nanoparticle samples" --yes
+./bin/fabric-agent --query "Download the silicon standard from beamline ID1"
+./bin/fabric-agent --query "Process all thaumatin datasets" --yes
 ```
-
-Every answer prints the generated SPARQL so you can check what was asked.
 
 ## Development
 
@@ -76,5 +108,5 @@ make vet
 make test
 ```
 
-Tests use a fake FabricNode (`httptest`) and a scripted LLM, so they need no
-network or API key.
+Tests use an in-process fake node (`internal/fakenode`) and a scripted LLM, so
+they need no network, node or API key.

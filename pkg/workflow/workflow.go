@@ -14,6 +14,7 @@ import (
 	"github.com/CHESSComputing/fabric-agent/pkg/agent"
 	"github.com/CHESSComputing/fabric-agent/pkg/config"
 	"github.com/CHESSComputing/fabric-agent/pkg/fabric"
+	"github.com/CHESSComputing/fabric-agent/pkg/logx"
 )
 
 // maxGraphsPerRun bounds how many graphs one request may download/process.
@@ -36,7 +37,7 @@ func NewEngine(cfg *config.Config, client *fabric.Client) *Engine {
 
 // Run performs the follow-up actions for ans according to its intent.
 func (e *Engine) Run(ctx context.Context, ans *agent.Answer, confirm Confirm) error {
-	if ans.Result == nil || ans.Plan.Intent == agent.IntentQuery {
+	if len(ans.Steps) == 0 || ans.Plan.Intent == agent.IntentQuery {
 		return nil // clarification requested, or nothing further to do
 	}
 	if len(ans.Graphs) == 0 {
@@ -44,6 +45,7 @@ func (e *Engine) Run(ctx context.Context, ans *agent.Answer, confirm Confirm) er
 		return nil
 	}
 
+	logx.Infof("workflow: intent=%s, %d candidate graph(s)", ans.Plan.Intent, len(ans.Graphs))
 	graphs := ans.Graphs
 	if len(graphs) > maxGraphsPerRun {
 		fmt.Printf("\nQuery matched %d graphs; only the first %d will be used.\n", len(graphs), maxGraphsPerRun)

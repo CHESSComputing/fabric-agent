@@ -3,14 +3,14 @@ package agent
 import (
 	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/CHESSComputing/fabric-agent/internal/fakenode"
 	"github.com/CHESSComputing/fabric-agent/pkg/config"
 	"github.com/CHESSComputing/fabric-agent/pkg/fabric"
 	"github.com/CHESSComputing/fabric-agent/pkg/llm"
+	"github.com/CHESSComputing/fabric-agent/pkg/logx"
 )
 
 // scriptedLLM returns canned replies in order and records the conversations.
@@ -27,129 +27,227 @@ func (s *scriptedLLM) Chat(ctx context.Context, msgs []llm.Message, opts llm.Opt
 	return s.replies[len(s.calls)-1], nil
 }
 
-const graphA = "http://node/graphs/sample_name=thaumatin-a"
-
-// fakeNode emulates the parts of FabricNode the agent talks to. Queries that
-// contain failOn get an HTTP 400.
-func fakeNode(t *testing.T, failOn string) *httptest.Server {
+func newTestAgent(t *testing.T, n *fakenode.Node, l llm.Client) *Agent {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/graphs":
-			fmt.Fprintf(w, `{"graphs":[%q,"http://node/graphs/beamlines"]}`, graphA)
-		case "/sparql":
-			q := r.URL.Query().Get("query")
-			if failOn != "" && strings.Contains(q, failOn) {
-				http.Error(w, "unsupported: "+failOn, http.StatusBadRequest)
-				return
-			}
-			if strings.Contains(q, "?v") { // schema introspection
-				fmt.Fprint(w, `{"head":{"vars":["v"]},"results":{"bindings":[]}}`)
-				return
-			}
-			fmt.Fprintf(w, `{"head":{"vars":["graph"]},"results":{"bindings":[{"graph":{"type":"uri","value":%q}}]}}`, graphA)
-		case "/.well-known/void":
-			fmt.Fprint(w, "@prefix void: <http://rdfs.org/ns/void#> .")
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(srv.Close)
-	return srv
-}
-
-func newTestAgent(t *testing.T, srv *httptest.Server, l llm.Client) *Agent {
-	t.Helper()
-	fcfg := &config.FabricNodeConfig{CatalogURL: srv.URL, DataURL: srv.URL, TimeoutSeconds: 5}
-	acfg := &config.AgentConfig{Mode: "openai", MaxRows: 50, MaxRetries: 2, SchemaMaxChars: 1000, SchemaTTLSeconds: 60}
+	logx.SetLevel(logx.Off)
+	fcfg := &config.FabricNodeConfig{CatalogURL: n.URL, DataURL: n.URL, TimeoutSeconds: 5}
+	acfg := &config.AgentConfig{Mode: "openai", MaxRows: 50, MaxRetries: 2, SchemaTTLSeconds: 60}
 	return NewAgentWithLLM(acfg, fabric.NewClient(fcfg), l)
 }
 
-func reply(intent, q string) string {
-	return fmt.Sprintf(`{"intent":%q,"sparql":%q,"explanation":"test","clarification":""}`, intent, q)
+func plan(intent, calls string) string {
+	return fmt.Sprintf(`{"intent":%q,"calls":%s,"explanation":"test","clarification":""}`, intent, calls)
 }
 
-func TestAskHappyPath(t *testing.T) {
-	srv := fakeNode(t, "")
+func lastUserMessage(msgs []llm.Message) string { return msgs[len(msgs)-1].Content }
+
+func TestFindMatchesGraphName(t *testing.T) {
+	n := fakenode.New(t)
 	l := &scriptedLLM{replies: []string{
-		"```json\n" + reply("download", "SELECT DISTINCT ?graph WHERE { GRAPH ?graph { ?s ?p ?o } }") + "\n```",
+		"```json\n" + plan("download", `[{"op":"find","keywords":["thaumatin"]}]`) + "\n```",
 	}}
-	a := newTestAgent(t, srv, l)
+	a := newTestAgent(t, n, l)
 
 	ans, err := a.Ask(context.Background(), "download thaumatin datasets")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ans.Plan.Intent != IntentDownload || ans.Attempts != 1 {
-		t.Errorf("plan=%+v attempts=%d", ans.Plan, ans.Attempts)
+	if ans.Plan.Intent != IntentDownload || ans.Attempts != 1 || len(ans.Steps) != 1 {
+		t.Fatalf("plan=%+v attempts=%d steps=%d", ans.Plan, ans.Attempts, len(ans.Steps))
 	}
-	if !strings.Contains(ans.Plan.SPARQL, "LIMIT 50") {
-		t.Errorf("LIMIT not enforced: %s", ans.Plan.SPARQL)
-	}
-	if len(ans.Graphs) != 1 || ans.Graphs[0] != graphA {
+	if len(ans.Graphs) != 1 || ans.Graphs[0] != fakenode.GraphThaumatin {
 		t.Errorf("graphs = %v", ans.Graphs)
 	}
-	if !strings.Contains(l.calls[0][0].Content, graphA) {
-		t.Error("system prompt does not contain discovered graph list")
+	row := ans.Steps[0].Result.Rows[0]
+	if row["beamline"] != "id3a" || row["sample"] != "thaumatin-a" || !strings.Contains(row["matched_by"], "graph name") {
+		t.Errorf("row = %v", row)
+	}
+	// the prompt is built from what the node reported, not from hardcoded values
+	sys := l.calls[0][0].Content
+	for _, want := range []string{"id3a", "Beamline ID3A", "thaumatin-a", "http://chess/detector"} {
+		if !strings.Contains(sys, want) {
+			t.Errorf("system prompt lacks %q", want)
+		}
 	}
 }
 
-func TestAskRepairsAfterEndpointError(t *testing.T) {
-	srv := fakeNode(t, "CONTAINS")
+func TestFindMatchesTextValue(t *testing.T) {
+	n := fakenode.New(t)
+	l := &scriptedLLM{replies: []string{plan("query", `[{"op":"find","keywords":["pilatus"]}]`)}}
+	a := newTestAgent(t, n, l)
+
+	ans, err := a.Ask(context.Background(), "which datasets used the Pilatus detector?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := ans.Steps[0].Result.Rows
+	if len(rows) != 1 || rows[0]["graph"] != fakenode.GraphThaumatin || !strings.Contains(rows[0]["matched_by"], "text value") {
+		t.Errorf("rows = %v", rows)
+	}
+}
+
+func TestFindKeywordsAreAnded(t *testing.T) {
+	n := fakenode.New(t)
 	l := &scriptedLLM{replies: []string{
-		reply("query", `SELECT ?graph WHERE { GRAPH ?graph { ?s ?p ?o FILTER(CONTAINS(STR(?o), "x")) } }`),
-		reply("query", "SELECT ?graph WHERE { GRAPH ?graph { ?s ?p ?o } }"),
+		plan("query", `[{"op":"find","keywords":["thaumatin","eiger"]}]`), // no single dataset has both
+		plan("query", `[{"op":"find","keywords":["thaumatin"]}]`),
 	}}
-	a := newTestAgent(t, srv, l)
+	a := newTestAgent(t, n, l)
+
+	ans, err := a.Ask(context.Background(), "thaumatin measured with eiger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ans.Attempts != 2 || len(ans.Graphs) != 1 {
+		t.Errorf("attempts=%d graphs=%v", ans.Attempts, ans.Graphs)
+	}
+	if !strings.Contains(lastUserMessage(l.calls[1]), "found nothing") {
+		t.Error("the model was not told that the first plan found nothing")
+	}
+}
+
+func TestListGraphsByBeamlineAndKeyword(t *testing.T) {
+	n := fakenode.New(t)
+	l := &scriptedLLM{replies: []string{plan("query", `[{"op":"list_graphs","beamline":"ID1","keywords":["2024-3"]}]`)}}
+	a := newTestAgent(t, n, l)
+
+	ans, err := a.Ask(context.Background(), "datasets from cycle 2024-3 on ID1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ans.Graphs) != 1 || ans.Graphs[0] != fakenode.GraphSilicon {
+		t.Errorf("graphs = %v", ans.Graphs)
+	}
+}
+
+func TestRepairsInvalidCall(t *testing.T) {
+	n := fakenode.New(t)
+	l := &scriptedLLM{replies: []string{
+		plan("query", `[{"op":"frobnicate"}]`),
+		plan("query", `[{"op":"beamlines"}]`),
+	}}
+	a := newTestAgent(t, n, l)
+
+	ans, err := a.Ask(context.Background(), "what beamlines exist?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ans.Attempts != 2 || len(ans.Steps[0].Result.Rows) != 2 {
+		t.Errorf("attempts=%d rows=%v", ans.Attempts, ans.Steps[0].Result.Rows)
+	}
+	if !strings.Contains(lastUserMessage(l.calls[1]), "unknown op") {
+		t.Errorf("validation error not fed back: %q", lastUserMessage(l.calls[1]))
+	}
+}
+
+func TestRepairsAfterNodeRejectsCall(t *testing.T) {
+	n := fakenode.New(t)
+	n.RejectSearch = "bad"
+	l := &scriptedLLM{replies: []string{
+		plan("query", `[{"op":"find","keywords":["bad"]}]`),
+		plan("query", `[{"op":"find","keywords":["eiger2"]}]`),
+	}}
+	a := newTestAgent(t, n, l)
 
 	ans, err := a.Ask(context.Background(), "anything")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ans.Attempts != 2 {
-		t.Errorf("attempts = %d, want 2", ans.Attempts)
+	if ans.Attempts != 2 || len(ans.Graphs) != 1 {
+		t.Errorf("attempts=%d graphs=%v", ans.Attempts, ans.Graphs)
 	}
-	last := l.calls[1][len(l.calls[1])-1].Content
-	if !strings.Contains(last, "unsupported: CONTAINS") {
-		t.Errorf("endpoint error not fed back to the LLM: %q", last)
+	if !strings.Contains(lastUserMessage(l.calls[1]), "search term rejected") {
+		t.Errorf("node error not fed back: %q", lastUserMessage(l.calls[1]))
 	}
 }
 
-func TestAskRejectsUpdatesAndGivesUp(t *testing.T) {
-	srv := fakeNode(t, "")
-	bad := reply("query", "DROP ALL")
+func TestUnreachableNodeFailsFast(t *testing.T) {
+	n := fakenode.New(t)
+	l := &scriptedLLM{replies: []string{plan("query", `[{"op":"list_graphs"}]`), plan("query", `[{"op":"list_graphs"}]`)}}
+	a := newTestAgent(t, n, l)
+	n.Close()
+
+	if _, err := a.Ask(context.Background(), "list everything"); err == nil {
+		t.Fatal("expected an error")
+	}
+	if len(l.calls) != 1 {
+		t.Errorf("the model was called %d times; a network failure must not trigger repairs", len(l.calls))
+	}
+}
+
+func TestGivesUpAfterRepeatedInvalidPlans(t *testing.T) {
+	n := fakenode.New(t)
+	bad := plan("query", `[{"op":"find"}]`) // find without keywords
 	l := &scriptedLLM{replies: []string{bad, bad, bad}}
-	a := newTestAgent(t, srv, l)
+	a := newTestAgent(t, n, l)
 
-	if _, err := a.Ask(context.Background(), "wipe everything"); err == nil {
-		t.Fatal("expected error for update query")
+	if _, err := a.Ask(context.Background(), "x"); err == nil {
+		t.Fatal("expected an error after exhausting retries")
+	}
+	if len(l.calls) != 3 {
+		t.Errorf("model called %d times, want 3", len(l.calls))
 	}
 }
 
-func TestAskClarification(t *testing.T) {
-	srv := fakeNode(t, "")
-	l := &scriptedLLM{replies: []string{`{"intent":"query","sparql":"","explanation":"","clarification":"Which beamline?"}`}}
-	a := newTestAgent(t, srv, l)
+func TestClarification(t *testing.T) {
+	n := fakenode.New(t)
+	l := &scriptedLLM{replies: []string{`{"intent":"query","calls":[],"explanation":"","clarification":"Which beamline?"}`}}
+	a := newTestAgent(t, n, l)
 
 	ans, err := a.Ask(context.Background(), "show data")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ans.Plan.Clarification != "Which beamline?" || ans.Result != nil {
+	if ans.Plan.Clarification != "Which beamline?" || len(ans.Steps) != 0 {
 		t.Errorf("unexpected answer: %+v", ans)
 	}
 }
 
 func TestHeuristicFallback(t *testing.T) {
-	srv := fakeNode(t, "")
-	a := newTestAgent(t, srv, nil)
+	n := fakenode.New(t)
+	a := newTestAgent(t, n, nil)
 
-	ans, err := a.Ask(context.Background(), "Find all ID3A datasets with thaumatin")
+	ans, err := a.Ask(context.Background(), "Please download all thaumatin datasets from ID3A")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(ans.Plan.SPARQL, `"thaumatin"`) || strings.Contains(ans.Plan.SPARQL, `"with"`) {
-		t.Errorf("keywords not extracted properly: %s", ans.Plan.SPARQL)
+	c := ans.Plan.Calls[0]
+	if ans.Plan.Intent != IntentDownload || c.Op != OpFind || c.Beamline != "id3a" || len(c.Keywords) != 1 || c.Keywords[0] != "thaumatin" {
+		t.Errorf("plan = %+v call = %+v", ans.Plan, c)
+	}
+	if len(ans.Graphs) != 1 || ans.Graphs[0] != fakenode.GraphThaumatin {
+		t.Errorf("graphs = %v", ans.Graphs)
+	}
+}
+
+func TestParsePlanIsLenient(t *testing.T) {
+	p, err := parsePlan(`Sure: {"call":{"op":"List_Graphs","beamline":"ID3A","keywords":"2024-3, btr101"}}`, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := p.Calls[0]
+	if c.Op != OpListGraphs || c.Beamline != "id3a" || len(c.Keywords) != 2 || c.Keywords[1] != "btr101" {
+		t.Errorf("call = %+v", c)
+	}
+	if p.Intent != IntentQuery {
+		t.Errorf("intent defaults to query, got %q", p.Intent)
+	}
+	if _, err := parsePlan(`{"calls":[],"clarification":""}`, "q"); err == nil {
+		t.Error("empty plan must be rejected")
+	}
+	if _, err := parsePlan(`{"calls":[{"op":"list_graphs","beamline":"a b"}]}`, "q"); err == nil {
+		t.Error("invalid beamline must be rejected")
+	}
+}
+
+func TestNormMatching(t *testing.T) {
+	for _, kw := range []string{"thaumatin", "Thaumatin-A", "thaumatin a", "SAMPLE_NAME=thaumatin"} {
+		if !containsNorm(fakenode.GraphThaumatin, kw) {
+			t.Errorf("%q should match %s", kw, fakenode.GraphThaumatin)
+		}
+	}
+	if containsNorm(fakenode.GraphThaumatin, "lysozyme") || containsNorm(fakenode.GraphThaumatin, "") {
+		t.Error("unexpected match")
 	}
 }
 
@@ -160,5 +258,29 @@ func TestExtractJSON(t *testing.T) {
 	}
 	if extractJSON("no json here") != "" {
 		t.Error("expected empty string")
+	}
+}
+
+func TestPromptOffersBeamlinesThatHaveDataEvenIfNotInCatalog(t *testing.T) {
+	n := fakenode.New(t)
+	n.CatalogIDs = []string{"1a3", "2a"} // none of them has datasets
+	logx.SetLevel(logx.Off)
+	fc := fabric.NewClient(&config.FabricNodeConfig{CatalogURL: n.URL, DataURL: n.URL, TimeoutSeconds: 5})
+
+	sch, err := discoverSchema(context.Background(), fc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"1a3", "2a", "id1", "id3a"} {
+		if !sch.hasBeamline(id) {
+			t.Errorf("beamline %s missing from schema", id)
+		}
+	}
+	prompt := systemPrompt(sch)
+	if !strings.Contains(prompt, "- id1: Beamline ID1") && !strings.Contains(prompt, "- id1, 1 dataset(s)") {
+		t.Errorf("prompt does not list id1 with its dataset count:\n%s", beamlineLines(sch))
+	}
+	if !strings.Contains(beamlineLines(sch), "1a3: Beamline 1A3 (test), 0 dataset(s)") {
+		t.Errorf("empty catalog beamline should be shown with 0 datasets:\n%s", beamlineLines(sch))
 	}
 }

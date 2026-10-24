@@ -1,5 +1,5 @@
-// Package agent turns natural-language questions into SPARQL queries for a
-// FabricNode, runs them, repairs them when the endpoint or validator objects,
+// Package agent turns natural-language questions into calls against the
+// FabricNode API, executes them, repairs the plan when the node rejects it,
 // and optionally summarizes the answer.
 package agent
 
@@ -16,10 +16,11 @@ import (
 	"github.com/CHESSComputing/fabric-agent/pkg/config"
 	"github.com/CHESSComputing/fabric-agent/pkg/fabric"
 	"github.com/CHESSComputing/fabric-agent/pkg/llm"
+	"github.com/CHESSComputing/fabric-agent/pkg/logx"
 	"github.com/CHESSComputing/fabric-agent/pkg/sparql"
 )
 
-// Intent says what the user wants done with the query results.
+// Intent says what the user wants done with the results.
 type Intent string
 
 const (
@@ -28,25 +29,39 @@ const (
 	IntentProcess  Intent = "process"  // download, derive and register
 )
 
-// Plan is the LLM's (validated) interpretation of a question.
+// Plan is the interpretation of a question: what to call and why.
 type Plan struct {
 	Question      string
 	Intent        Intent
-	SPARQL        string
+	Calls         []Call
 	Explanation   string
-	Clarification string // non-empty: the agent needs more information
+	Clarification string // non-empty (and Calls empty): the agent needs more information
+}
+
+func (p *Plan) callsJSON() string {
+	b, err := json.Marshal(p.Calls)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+// Step is one executed call and its result table.
+type Step struct {
+	Call   Call
+	Result *sparql.Result
 }
 
 // Answer is the outcome of Ask.
 type Answer struct {
 	Plan     *Plan
-	Result   *sparql.Result // nil when Plan.Clarification is set
+	Steps    []Step // empty when Plan.Clarification is set
 	Attempts int
 	Summary  string   // natural-language answer, if summarization is enabled
-	Graphs   []string // named graphs found in Result
+	Graphs   []string // dataset graphs found in the results
 }
 
-type turn struct{ Question, SPARQL string }
+type turn struct{ Question, Calls string }
 
 type Agent struct {
 	cfg    *config.AgentConfig
@@ -57,6 +72,8 @@ type Agent struct {
 	schema   *Schema
 	schemaAt time.Time
 	recent   []turn
+
+	preflightOK bool
 }
 
 // NewAgent creates an agent using the LLM back-end selected in cfg.
@@ -87,6 +104,7 @@ func (a *Agent) Ask(ctx context.Context, question string) (*Answer, error) {
 		return nil, errors.New("empty question")
 	}
 	fmt.Printf("\n[AI Agent] Analyzing question: %q...\n", question)
+	logx.Infof("question: %q", question)
 
 	sch, err := a.loadSchema(ctx)
 	if err != nil {
@@ -103,18 +121,18 @@ func (a *Agent) Ask(ctx context.Context, question string) (*Answer, error) {
 		return nil, err
 	}
 
-	if ans.Plan.Clarification == "" {
-		a.remember(question, ans.Plan.SPARQL)
+	if len(ans.Plan.Calls) > 0 {
+		a.remember(question, ans.Plan.callsJSON())
 	}
-	if ans.Result != nil {
-		ans.Graphs = graphsIn(ans.Result, sch.Graphs)
-		if a.cfg.Summarize && a.llm != nil && ans.Result.Structured {
-			summary, serr := a.summarize(ctx, question, ans)
-			if serr != nil {
-				fmt.Fprintf(os.Stderr, "[AI Agent] warning: summary failed: %v\n", serr)
-			}
-			ans.Summary = summary
+	ans.Graphs = graphsIn(ans.Steps, sch.Graphs)
+	logx.Infof("done: %d call(s), %d dataset graph(s) in the results", len(ans.Steps), len(ans.Graphs))
+
+	if a.cfg.Summarize && a.llm != nil && len(ans.Steps) > 0 {
+		summary, serr := a.summarize(ctx, question, ans)
+		if serr != nil {
+			fmt.Fprintf(os.Stderr, "[AI Agent] warning: summary failed: %v\n", serr)
 		}
+		ans.Summary = summary
 	}
 	return ans, nil
 }
@@ -124,23 +142,35 @@ func (a *Agent) askLLM(ctx context.Context, question string, sch *Schema) (*Answ
 	recent := append([]turn(nil), a.recent...)
 	a.mu.Unlock()
 
-	msgs := []llm.Message{
-		{Role: "system", Content: systemPrompt(a.cfg, sch)},
-		{Role: "user", Content: userPrompt(question, recent)},
+	if err := a.preflight(ctx); err != nil {
+		return nil, err
 	}
-	opts := llm.Options{Temperature: a.cfg.Temperature, MaxTokens: a.cfg.MaxTokens, JSON: true}
+
+	system := systemPrompt(sch)
+	user := userPrompt(question, recent)
+	logx.Block(logx.Debug, fmt.Sprintf("LLM system prompt (%d chars)", len(system)), system)
+	logx.Block(logx.Debug, "LLM user prompt", user)
+
+	msgs := []llm.Message{
+		{Role: "system", Content: system},
+		{Role: "user", Content: user},
+	}
+	opts := llm.Options{Temperature: a.cfg.Temperature, MaxTokens: a.cfg.MaxTokens, NumCtx: a.cfg.NumCtx, JSON: true}
 
 	maxAttempts := a.cfg.MaxRetries + 1
 	var lastErr error
 	var lastOK *Answer
 	emptyRetried := false
 
-	feedback := func(format string, args ...interface{}) {
-		msgs = append(msgs, llm.Message{Role: "user", Content: fmt.Sprintf(format, args...)})
+	retry := func(format string, args ...interface{}) {
+		msg := fmt.Sprintf(format, args...)
+		logx.Infof("asking the model to repair its answer: %s", firstLine(msg))
+		msgs = append(msgs, llm.Message{Role: "user", Content: msg})
 	}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		raw, err := a.llm.Chat(ctx, msgs, opts)
+		logx.Infof("planning attempt %d/%d", attempt, maxAttempts)
+		raw, err := a.chat(ctx, msgs, opts)
 		if err != nil {
 			return nil, fmt.Errorf("LLM request failed: %w", err)
 		}
@@ -149,32 +179,30 @@ func (a *Agent) askLLM(ctx context.Context, question string, sch *Schema) (*Answ
 		plan, err := parsePlan(raw, question)
 		if err != nil {
 			lastErr = err
-			feedback("Your reply was not usable: %v. Reply again with ONLY the JSON object described in the rules.", err)
+			logx.Infof("plan rejected: %v", err)
+			retry("Your reply was not usable: %v. Reply again with ONLY the JSON object described in the rules.", err)
 			continue
 		}
-		if plan.Clarification != "" && strings.TrimSpace(plan.SPARQL) == "" {
-			return &Answer{Plan: plan, Attempts: attempt}, nil
+		logx.Infof("plan: intent=%s, %d call(s): %s", plan.Intent, len(plan.Calls), plan.callsJSON())
+		if len(plan.Calls) == 0 {
+			return &Answer{Plan: plan, Attempts: attempt}, nil // clarification requested
 		}
 
-		q, err := sparql.Validate(plan.SPARQL, a.cfg.MaxRows)
+		steps, err := a.execute(ctx, plan)
 		if err != nil {
 			lastErr = err
-			feedback("The query was rejected by the validator: %v. Fix it and reply with the JSON object again.", err)
-			continue
-		}
-		plan.SPARQL = q
-
-		res, err := a.fabric.Query(ctx, q)
-		if err != nil {
-			lastErr = err
-			feedback("The SPARQL endpoint returned an error:\n%v\nFix the query (it may use a feature the endpoint does not support) and reply with the JSON object again.", err)
+			var se *fabric.StatusError
+			if !errors.As(err, &se) {
+				return nil, err // node unreachable or similar: rewriting the plan will not help
+			}
+			retry("The node rejected the call: %v\nFix the call and reply with the JSON object again.", err)
 			continue
 		}
 
-		lastOK = &Answer{Plan: plan, Result: res, Attempts: attempt}
-		if res.IsEmpty() && !emptyRetried && attempt < maxAttempts {
+		lastOK = &Answer{Plan: plan, Steps: steps, Attempts: attempt}
+		if allEmpty(steps) && !emptyRetried && attempt < maxAttempts {
 			emptyRetried = true
-			feedback("The query ran but returned no results. If the filters were too strict (exact string match, wrong IRI, wrong case) relax them and reply with a new JSON object. If the data really does not exist, return the same query again.")
+			retry("The calls ran but found nothing. If the keywords were too specific or too many, use fewer or more distinctive ones, or switch to list_graphs. If the data really does not exist, return the same calls again.")
 			continue
 		}
 		return lastOK, nil
@@ -183,30 +211,90 @@ func (a *Agent) askLLM(ctx context.Context, question string, sch *Schema) (*Answ
 	if lastOK != nil {
 		return lastOK, nil
 	}
-	return nil, fmt.Errorf("no working query after %d attempt(s): %w", maxAttempts, lastErr)
+	return nil, fmt.Errorf("no working plan after %d attempt(s): %w", maxAttempts, lastErr)
 }
 
 func (a *Agent) askHeuristic(ctx context.Context, question string, sch *Schema) (*Answer, error) {
-	plan := heuristicPlan(question, a.cfg.MaxRows)
-	q, err := sparql.Validate(plan.SPARQL, a.cfg.MaxRows)
+	plan := heuristicPlan(question, sch)
+	logx.Infof("heuristic plan: intent=%s, %d call(s): %s", plan.Intent, len(plan.Calls), plan.callsJSON())
+	steps, err := a.execute(ctx, plan)
 	if err != nil {
 		return nil, err
 	}
-	plan.SPARQL = q
-	res, err := a.fabric.Query(ctx, q)
-	if err != nil {
-		return nil, err
+	return &Answer{Plan: plan, Steps: steps, Attempts: 1}, nil
+}
+
+// execute runs the calls of plan in order.
+func (a *Agent) execute(ctx context.Context, plan *Plan) ([]Step, error) {
+	var steps []Step
+	for i, c := range plan.Calls {
+		logx.Infof("executing call %d/%d: %s", i+1, len(plan.Calls), c)
+		res, err := a.runCall(ctx, c)
+		if err != nil {
+			return steps, fmt.Errorf("call %d (%s) failed: %w", i+1, c, err)
+		}
+		logx.Infof("call %d returned %s", i+1, describeResult(res))
+		steps = append(steps, Step{Call: c, Result: res})
 	}
-	return &Answer{Plan: plan, Result: res, Attempts: 1}, nil
+	return steps, nil
+}
+
+// preflight checks once that the LLM back-end is reachable, if it can.
+func (a *Agent) preflight(ctx context.Context) error {
+	pf, ok := a.llm.(llm.Preflighter)
+	if !ok {
+		return nil
+	}
+	a.mu.Lock()
+	done := a.preflightOK
+	a.mu.Unlock()
+	if done {
+		return nil
+	}
+	if err := pf.Preflight(ctx); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.preflightOK = true
+	a.mu.Unlock()
+	return nil
+}
+
+// chat calls the LLM and, while waiting, reports every 10 seconds that it is
+// still waiting, so a slow local model does not look like a hang.
+func (a *Agent) chat(ctx context.Context, msgs []llm.Message, opts llm.Options) (string, error) {
+	done := make(chan struct{})
+	defer close(done)
+	start := time.Now()
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				logx.Infof("still waiting for the language model... %s elapsed (large local models can take minutes on CPU)",
+					time.Since(start).Round(time.Second))
+			}
+		}
+	}()
+	return a.llm.Chat(ctx, msgs, opts)
 }
 
 func (a *Agent) summarize(ctx context.Context, question string, ans *Answer) (string, error) {
-	msgs := []llm.Message{
-		{Role: "system", Content: "You assist beamline scientists. Answer the question concisely (at most five sentences) using ONLY the query results provided. If the results are empty, say that nothing was found. Never invent data."},
-		{Role: "user", Content: fmt.Sprintf("Question: %s\n\nSPARQL used:\n%s\n\nResults (tab-separated):\n%s",
-			question, ans.Plan.SPARQL, ans.Result.CompactText(40, 6000))},
+	var b strings.Builder
+	for i, st := range ans.Steps {
+		fmt.Fprintf(&b, "Call %d: %s\n%s\n", i+1, st.Call, st.Result.CompactText(30, 3000))
 	}
-	out, err := a.llm.Chat(ctx, msgs, llm.Options{Temperature: a.cfg.Temperature, MaxTokens: a.cfg.MaxTokens})
+	msgs := []llm.Message{
+		{Role: "system", Content: "You assist beamline scientists. Answer the question concisely (at most five sentences) using ONLY the results provided. If the results are empty, say that nothing was found. Never invent data."},
+		{Role: "user", Content: fmt.Sprintf("Question: %s\n\nResults (tab-separated):\n%s", question, b.String())},
+	}
+	logx.Infof("asking the model to summarize the results")
+	out, err := a.chat(ctx, msgs, llm.Options{Temperature: a.cfg.Temperature, MaxTokens: a.cfg.MaxTokens, NumCtx: a.cfg.NumCtx})
 	return strings.TrimSpace(out), err
 }
 
@@ -216,9 +304,10 @@ func (a *Agent) loadSchema(ctx context.Context) (*Schema, error) {
 
 	ttl := time.Duration(a.cfg.SchemaTTLSeconds) * time.Second
 	if a.schema != nil && time.Since(a.schemaAt) < ttl {
+		logx.Debugf("using cached schema (age %s)", time.Since(a.schemaAt).Round(time.Second))
 		return a.schema, nil
 	}
-	s, err := discoverSchema(ctx, a.fabric, a.cfg.SchemaMaxChars)
+	s, err := discoverSchema(ctx, a.fabric)
 	if err != nil {
 		if a.schema != nil { // keep the older, better schema and retry next time
 			return a.schema, err
@@ -231,44 +320,61 @@ func (a *Agent) loadSchema(ctx context.Context) (*Schema, error) {
 	return s, nil
 }
 
-func (a *Agent) remember(question, q string) {
+func (a *Agent) remember(question, calls string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.recent = append(a.recent, turn{question, q})
+	a.recent = append(a.recent, turn{question, calls})
 	if len(a.recent) > 3 {
 		a.recent = a.recent[len(a.recent)-3:]
 	}
 }
 
-// graphsIn returns the cell values of res that are known named graphs; if the
-// graph list is unavailable it falls back to the ?graph column.
-func graphsIn(res *sparql.Result, known []string) []string {
+// graphsIn returns the cell values of all results that are known dataset graphs.
+func graphsIn(steps []Step, known []string) []string {
+	set := make(map[string]bool, len(known))
+	for _, g := range known {
+		set[g] = true
+	}
 	var out []string
-	if len(known) > 0 {
-		set := make(map[string]bool, len(known))
-		for _, g := range known {
-			set[g] = true
-		}
-		for _, v := range res.Values() {
-			if set[v] {
+	seen := map[string]bool{}
+	for _, st := range steps {
+		for _, v := range st.Result.Values() {
+			if set[v] && !seen[v] {
+				seen[v] = true
 				out = append(out, v)
 			}
-		}
-		return out
-	}
-	seen := map[string]bool{}
-	for _, row := range res.Rows {
-		if g, ok := row["graph"]; ok && !seen[g] {
-			seen[g] = true
-			out = append(out, g)
 		}
 	}
 	return out
 }
 
+func allEmpty(steps []Step) bool {
+	for _, st := range steps {
+		if !st.Result.IsEmpty() {
+			return false
+		}
+	}
+	return true
+}
+
+func describeResult(r *sparql.Result) string {
+	if r.IsEmpty() {
+		return "no rows"
+	}
+	return fmt.Sprintf("%d row(s)", len(r.Rows))
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
 type planJSON struct {
 	Intent        string `json:"intent"`
-	SPARQL        string `json:"sparql"`
+	Calls         []Call `json:"calls"`
+	Call          *Call  `json:"call"` // some models emit a single call
 	Explanation   string `json:"explanation"`
 	Clarification string `json:"clarification"`
 }
@@ -282,8 +388,22 @@ func parsePlan(raw, question string) (*Plan, error) {
 	if err := json.Unmarshal([]byte(js), &p); err != nil {
 		return nil, fmt.Errorf("invalid JSON: %v", err)
 	}
-	if strings.TrimSpace(p.SPARQL) == "" && strings.TrimSpace(p.Clarification) == "" {
-		return nil, errors.New(`both "sparql" and "clarification" are empty`)
+	if len(p.Calls) == 0 && p.Call != nil {
+		p.Calls = []Call{*p.Call}
+	}
+	if len(p.Calls) > maxCalls {
+		logx.Infof("plan has %d calls; keeping the first %d", len(p.Calls), maxCalls)
+		p.Calls = p.Calls[:maxCalls]
+	}
+	for i := range p.Calls {
+		p.Calls[i].normalize()
+		if err := p.Calls[i].Validate(); err != nil {
+			return nil, fmt.Errorf("call %d is invalid: %v", i+1, err)
+		}
+	}
+	clar := strings.TrimSpace(p.Clarification)
+	if len(p.Calls) == 0 && clar == "" {
+		return nil, errors.New(`"calls" is empty and "clarification" is empty`)
 	}
 
 	intent := IntentQuery
@@ -296,9 +416,9 @@ func parsePlan(raw, question string) (*Plan, error) {
 	return &Plan{
 		Question:      question,
 		Intent:        intent,
-		SPARQL:        strings.TrimSpace(p.SPARQL),
+		Calls:         p.Calls,
 		Explanation:   strings.TrimSpace(p.Explanation),
-		Clarification: strings.TrimSpace(p.Clarification),
+		Clarification: clar,
 	}, nil
 }
 

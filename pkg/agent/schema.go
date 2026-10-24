@@ -3,59 +3,98 @@ package agent
 import (
 	"context"
 	"errors"
-	"fmt"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/CHESSComputing/fabric-agent/pkg/fabric"
+	"github.com/CHESSComputing/fabric-agent/pkg/logx"
 )
 
-// Schema is what the agent knows about a FabricNode. It follows the node's
-// "progressive disclosure" design: service description (VoID), constraints
-// (SHACL) and worked query examples are read at run time from the Catalog
-// Service, so nothing about beamlines, samples or vocabularies is hardcoded.
+const rdfType = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+
+// Schema is what the agent knows about a FabricNode: its beamlines, which
+// datasets (graphs) exist, and which predicates/classes appear in the data.
+// It is read from the node at run time, so nothing is hardcoded.
 type Schema struct {
+	Beamlines  []fabric.BeamlineInfo
 	Graphs     []string
-	Void       string
-	SHACL      string
-	Examples   string
-	Classes    []string
+	Samples    []string       // distinct sample names found in graph IRIs
+	PerBL      map[string]int // beamline id -> number of dataset graphs
 	Predicates []string
+	Classes    []string
 }
 
 // discoverSchema gathers as much as it can. It always returns a non-nil
 // Schema; the error (if any) lists the parts that could not be fetched.
-func discoverSchema(ctx context.Context, fc *fabric.Client, maxChars int) (*Schema, error) {
-	s := &Schema{}
+func discoverSchema(ctx context.Context, fc *fabric.Client) (*Schema, error) {
+	start := time.Now()
+	s := &Schema{PerBL: map[string]int{}}
 	var problems []string
 
-	graphs, err := fc.ListGraphs(ctx)
+	logx.Infof("schema discovery: reading graphs, beamlines and a triple sample from the node")
+
+	graphs, err := fc.Graphs(ctx, "")
 	if err != nil {
 		problems = append(problems, err.Error())
 	} else {
 		s.Graphs = graphs
 	}
 
-	docs := []struct {
-		name string
-		dst  *string
-	}{
-		{"void", &s.Void},
-		{"shacl", &s.SHACL},
-		{"sparql-examples", &s.Examples},
-	}
-	for _, d := range docs {
-		txt, err := fc.WellKnown(ctx, d.name)
-		if err != nil {
-			problems = append(problems, fmt.Sprintf(".well-known/%s: %v", d.name, err))
-			continue
-		}
-		*d.dst = clipText(txt, maxChars)
+	bls, err := fc.Beamlines(ctx)
+	if err != nil {
+		problems = append(problems, err.Error())
+	} else {
+		s.Beamlines = bls
 	}
 
-	// Live vocabulary: what is actually used in the data. Best effort, because
-	// not every endpoint supports GRAPH ?g.
-	s.Classes = introspect(ctx, fc, "SELECT DISTINCT ?v WHERE { GRAPH ?g { ?s a ?v } } LIMIT 60")
-	s.Predicates = introspect(ctx, fc, "SELECT DISTINCT ?v WHERE { GRAPH ?g { ?s ?v ?o } } LIMIT 80")
+	// A sample of triples (the node caps it at 100) reveals the vocabulary in use.
+	if sample, err := fc.MatchTriples(ctx, fabric.TripleFilter{}); err != nil {
+		problems = append(problems, "triple sample: "+err.Error())
+	} else {
+		preds := map[string]int{}
+		classes := map[string]int{}
+		for _, row := range sample.Rows {
+			preds[row["p"]]++
+			if row["p"] == rdfType {
+				classes[row["o"]]++
+			}
+		}
+		s.Predicates = sortedKeys(preds)
+		s.Classes = sortedKeys(classes)
+	}
+
+	samples := map[string]int{}
+	for _, g := range s.Graphs {
+		info := fabric.ParseGraphIRI(g)
+		if info.Beamline != "" {
+			s.PerBL[info.Beamline]++
+		}
+		if info.Sample != "" {
+			samples[info.Sample]++
+		}
+	}
+	s.Samples = sortedKeys(samples)
+
+	// The catalog and the data can disagree (e.g. catalog ids 1a3, 2a, ... while
+	// the graphs are named id1, id3a, fast). Offer the model every beamline that
+	// has datasets, not only the catalog ones, or it will ask for empty ones.
+	have := map[string]bool{}
+	for _, b := range s.Beamlines {
+		have[b.ID] = true
+	}
+	for _, id := range sortedKeys(s.PerBL) {
+		if !have[id] {
+			s.Beamlines = append(s.Beamlines, fabric.BeamlineInfo{ID: id})
+		}
+	}
+	sort.Slice(s.Beamlines, func(i, j int) bool { return s.Beamlines[i].ID < s.Beamlines[j].ID })
+
+	logx.Infof("schema discovery finished in %s: %d graph(s), %d beamline(s), %d sample name(s), %d predicate(s), %d class(es)",
+		time.Since(start).Round(time.Millisecond), len(s.Graphs), len(s.Beamlines), len(s.Samples), len(s.Predicates), len(s.Classes))
+	logx.Block(logx.Debug, "schema: beamlines", beamlineLines(s))
+	logx.Block(logx.Debug, "schema: sample names", strings.Join(s.Samples, "\n"))
+	logx.Block(logx.Debug, "schema: predicates", strings.Join(s.Predicates, "\n"))
 
 	if len(problems) > 0 {
 		return s, errors.New(strings.Join(problems, "; "))
@@ -63,17 +102,11 @@ func discoverSchema(ctx context.Context, fc *fabric.Client, maxChars int) (*Sche
 	return s, nil
 }
 
-func introspect(ctx context.Context, fc *fabric.Client, q string) []string {
-	res, err := fc.Query(ctx, q)
-	if err != nil || !res.Structured {
-		return nil
+func (s *Schema) hasBeamline(id string) bool {
+	for _, b := range s.Beamlines {
+		if b.ID == id {
+			return true
+		}
 	}
-	return res.Values()
-}
-
-func clipText(s string, n int) string {
-	if n <= 0 || len(s) <= n {
-		return s
-	}
-	return s[:n] + "\n... [truncated]"
+	return false
 }

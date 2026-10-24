@@ -1,3 +1,5 @@
+// Package sparql parses the SPARQL 1.1 JSON results format, which is what the
+// FabricNode data-service answers with (columns s, p, o, g), and renders it.
 package sparql
 
 import (
@@ -36,6 +38,9 @@ type Result struct {
 	Boolean    *bool
 	Structured bool
 	Raw        []byte
+	// Notes are caveats to show with the table, e.g. "server capped the
+	// result at 100 triples".
+	Notes []string
 }
 
 // ParseResults parses a SPARQL JSON results document. It never fails: anything
@@ -96,6 +101,7 @@ func (r *Result) Values() []string {
 
 // WriteTable prints the result as an aligned text table (at most maxRows rows).
 func (r *Result) WriteTable(w io.Writer, maxRows int) {
+	defer r.writeNotes(w)
 	if !r.Structured {
 		fmt.Fprintf(w, "%s\n", clip(strings.TrimSpace(string(r.Raw)), 4000))
 		return
@@ -159,6 +165,12 @@ func (r *Result) WriteTable(w io.Writer, maxRows int) {
 		fmt.Fprintf(w, ", %d not shown", truncated)
 	}
 	fmt.Fprintln(w, ")")
+}
+
+func (r *Result) writeNotes(w io.Writer) {
+	for _, n := range r.Notes {
+		fmt.Fprintf(w, "note: %s\n", n)
+	}
 }
 
 // CompactText renders the result as tab-separated text for use in an LLM

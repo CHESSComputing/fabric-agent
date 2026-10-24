@@ -6,9 +6,14 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/CHESSComputing/fabric-agent/pkg/logx"
 )
 
 type Config struct {
+	// LogLevel controls diagnostic output on stderr: off, info, debug, trace.
+	// Overridden by env FABRIC_AGENT_LOG_LEVEL and the --log-level flag.
+	LogLevel   string           `yaml:"log_level"`
 	FabricNode FabricNodeConfig `yaml:"fabric_node"`
 	Agent      AgentConfig      `yaml:"agent"`
 	Storage    StorageConfig    `yaml:"storage"`
@@ -21,14 +26,10 @@ type FabricNodeConfig struct {
 	NotificationURL string `yaml:"notification_url"`
 	AuthToken       string `yaml:"auth_token"` // or env FABRIC_AUTH_TOKEN
 	TimeoutSeconds  int    `yaml:"timeout_seconds"`
-
-	// GraphDumpQuery is the SPARQL template used when a named graph is
-	// downloaded. Placeholders: {{graph}} (IRI, without <>) and {{limit}}.
-	GraphDumpQuery string `yaml:"graph_dump_query"`
-	GraphDumpLimit int    `yaml:"graph_dump_limit"`
 }
 
-// AgentConfig controls how natural-language questions are turned into SPARQL.
+// AgentConfig controls how natural-language questions are turned into calls
+// against the FabricNode API.
 //
 // Mode:
 //
@@ -48,31 +49,27 @@ type AgentConfig struct {
 	Temperature    float64 `yaml:"temperature"`
 	MaxTokens      int     `yaml:"max_tokens"`
 	TimeoutSeconds int     `yaml:"timeout_seconds"`
+	// NumCtx is the context window requested from Ollama. Ollama's own
+	// default is small and it silently cuts off long prompts.
+	NumCtx int `yaml:"num_ctx"`
 
 	// MaxRetries is the number of times the agent may ask the LLM to repair a
-	// query that was rejected by the validator or by the SPARQL endpoint.
-	// Unset/0 means 2; use a negative value to disable repairs.
+	// plan that was invalid, failed, or found nothing. Unset/0 means 2; use a
+	// negative value to disable repairs.
 	MaxRetries int `yaml:"max_retries"`
-	// MaxRows caps the LIMIT of generated queries and the rows printed.
+	// MaxRows caps the number of rows printed per result table.
 	MaxRows int `yaml:"max_rows"`
 
-	SchemaMaxChars   int `yaml:"schema_max_chars"`   // per VoID/SHACL/examples document
 	SchemaTTLSeconds int `yaml:"schema_ttl_seconds"` // schema cache lifetime
 
 	// Summarize asks the LLM to answer the question in prose from the results.
 	Summarize bool `yaml:"summarize"`
-	// DialectHint is free text appended to the LLM prompt, e.g. "The endpoint
-	// does not support FILTER or property paths."
-	DialectHint string `yaml:"dialect_hint"`
 }
 
 type StorageConfig struct {
 	DownloadDir string `yaml:"download_dir"`
 	OutputDir   string `yaml:"output_dir"`
 }
-
-// DefaultGraphDumpQuery is used when graph_dump_query is not configured.
-const DefaultGraphDumpQuery = "SELECT ?s ?p ?o WHERE { GRAPH <{{graph}}> { ?s ?p ?o } } LIMIT {{limit}}"
 
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -93,15 +90,17 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	if env := os.Getenv("FABRIC_AGENT_LOG_LEVEL"); env != "" {
+		c.LogLevel = env
+	}
+	c.LogLevel = strings.ToLower(strings.TrimSpace(c.LogLevel))
+	if c.LogLevel == "" {
+		c.LogLevel = "info"
+	}
+
 	fn := &c.FabricNode
 	if fn.TimeoutSeconds <= 0 {
 		fn.TimeoutSeconds = 30
-	}
-	if fn.GraphDumpQuery == "" {
-		fn.GraphDumpQuery = DefaultGraphDumpQuery
-	}
-	if fn.GraphDumpLimit <= 0 {
-		fn.GraphDumpLimit = 50
 	}
 	if fn.AuthToken == "" {
 		fn.AuthToken = os.Getenv("FABRIC_AUTH_TOKEN")
@@ -116,6 +115,12 @@ func (c *Config) applyDefaults() {
 	if a.TimeoutSeconds <= 0 {
 		a.TimeoutSeconds = 120
 	}
+	if a.NumCtx <= 0 {
+		a.NumCtx = 8192
+	}
+	if a.MaxTokens <= 0 {
+		a.MaxTokens = 1024
+	}
 	switch {
 	case a.MaxRetries == 0: // unset
 		a.MaxRetries = 2
@@ -124,9 +129,6 @@ func (c *Config) applyDefaults() {
 	}
 	if a.MaxRows <= 0 {
 		a.MaxRows = 100
-	}
-	if a.SchemaMaxChars <= 0 {
-		a.SchemaMaxChars = 6000
 	}
 	if a.SchemaTTLSeconds <= 0 {
 		a.SchemaTTLSeconds = 300
@@ -160,6 +162,9 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
+	if _, err := logx.Parse(c.LogLevel); err != nil {
+		return fmt.Errorf("log_level: %w", err)
+	}
 	a := &c.Agent
 	switch a.Mode {
 	case "heuristic", "ollama":

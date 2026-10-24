@@ -1,3 +1,11 @@
+# Diagnostic output on stderr (results always go to stdout):
+#   off    nothing
+#   info   one line per step: node API calls (URL, status, size, time), LLM calls, the plan
+#   debug  + response bodies, the prompts sent to the LLM and its raw reply (truncated)
+#   trace  + the same, untruncated
+# Overridden by env FABRIC_AGENT_LOG_LEVEL and by the --log-level flag.
+log_level: "info"
+
 fabric_node:
   catalog_url: "http://localhost:8781"
   data_url: "http://localhost:8782"
@@ -5,9 +13,6 @@ fabric_node:
   notification_url: "http://localhost:8784"
   auth_token: ""            # or env FABRIC_AUTH_TOKEN; sent as "Authorization: Bearer ..."
   timeout_seconds: 30
-  # SPARQL used when a graph is downloaded. {{graph}} and {{limit}} are filled in.
-  graph_dump_query: "SELECT ?s ?p ?o WHERE { GRAPH <{{graph}}> { ?s ?p ?o } } LIMIT {{limit}}"
-  graph_dump_limit: 50
 
 agent:
   # How questions are understood:
@@ -17,20 +22,17 @@ agent:
   #   heuristic  no LLM, keyword search only ("mock" and "live" are aliases)
   mode: "ollama"
   api_key: ""               # or env OPENAI_API_KEY / ANTHROPIC_API_KEY
-  base_url: ""              # optional endpoint override
-  model: "mistral"           # e.g. claude-sonnet-5-5, llama3.1
-  temperature: 0.2          # negative = do not send (some reasoning models require this)
-  max_tokens: 2048
-  timeout_seconds: 120
+  base_url: ""              # optional endpoint override (default http://localhost:11434 for ollama)
+  model: "mistral"          # e.g. gpt-4o, claude-sonnet-5-5, llama3.1
+  temperature: 0.1          # negative = do not send (some reasoning models require this)
+  max_tokens: 1024          # cap on generated tokens (Ollama: num_predict)
+  num_ctx: 8192             # Ollama context window; its default is small and silently truncates prompts
+  timeout_seconds: 300      # per LLM request; local models on CPU can be slow
 
-  max_retries: 2            # LLM may repair a rejected/failing query this many times (-1 = never)
-  max_rows: 100             # LIMIT cap for generated queries and rows printed
-  schema_max_chars: 6000    # per VoID / SHACL / example-queries document sent to the LLM
-  schema_ttl_seconds: 300
-  summarize: true           # also answer in prose from the results
-  # Free-text notes for the LLM about what the SPARQL endpoint supports, e.g.:
-  # dialect_hint: "The endpoint is a small in-memory store: avoid property paths and subqueries."
-  dialect_hint: ""
+  max_retries: 2            # the LLM may repair a plan this many times (-1 = never)
+  max_rows: 100             # rows printed per result table
+  schema_ttl_seconds: 300   # how long the node's beamlines/graphs are cached
+  summarize: false          # also answer in prose from the results (one more LLM call)
 
 storage:
   download_dir: "./tmp/downloads"
